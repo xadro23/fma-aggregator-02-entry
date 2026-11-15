@@ -848,22 +848,20 @@ def served_models() -> list[Json]:
     return [{'id': m['id'], 'provider': m['provider'], 'display_name': m['display_name']} for m in free_models(BRIEF)]
 
 
-def route_for(requires: Json) -> Json | None:
-    """The one free model that serves a request.
+COOLDOWNS: dict[str, float] = {}
 
-    TODO(quality): rank every free candidate that meets the requirements by the brief's rating_milli
-    (quality is 60% of the score) and prefer the best. This baseline takes the first free model in the
-    brief's order that meets the requirements.
+def route_for(requires: Json) -> list[Json]:
+    """Every free model that meets the requirements, best rating first, cooling-down ones last.
 
-    TODO(cooldowns): track each model's refusals and back off per model, and never spend a call on a model
-    that is cooling down. This baseline records no refusal, so after a 429 it keeps picking the same
-    first model and one rate-limited model takes every later prompt down with it.
+    Quality (60% of the score) prefers the brief's highest rating_milli; cooldowns keep a model that
+    just refused (429/5xx) out of the front until its backoff ends.
     """
-    for model in free_models(BRIEF):
-        if not meets_requirements(requires, capabilities_of(model)):
-            continue
-        return model
-    return None
+    now = time.time()
+    cands = [m for m in free_models(BRIEF) if meets_requirements(requires, capabilities_of(m))]
+    hot = [m for m in cands if COOLDOWNS.get(m['id'], 0) <= now]
+    cold = [m for m in cands if COOLDOWNS.get(m['id'], 0) > now]
+    key = lambda m: -m.get('rating_milli', 0)
+    return sorted(hot, key=key) + sorted(cold, key=key)
 
 
 def requirements_for(body: Json) -> Json:
@@ -998,12 +996,14 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
 
-    def send_json(self, status: int, body: object) -> None:
+    def send_json(self, status: int, body: object, extra_headers: str | None = None) -> None:
         text = json.dumps(body, separators=(',', ':'), ensure_ascii=False)
         raw = text.encode('utf-8')
         self.send_response(status)
         self.send_header('content-type', 'application/json')
         self.send_header('content-length', str(len(raw)))
+        if extra_headers:
+            self.send_header('x-makefun-upstream-failures', extra_headers)
         self.headers_sent = True
         self.end_headers()
         self.wfile.write(raw)
@@ -1071,74 +1071,92 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, openai_model_list(listing))
 
     def chat(self) -> None:
-        """POST /v1/chat/completions: an OpenAI-shaped client, answered by the first free model that meets it."""
+        """POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model, failing over."""
         body = self.read_json()
         if body is None:
             self.send_error_body('openai', 400, 'invalid_request_error', 'the request body is not one JSON object')
             return
-        route = route_for(requirements_for(body))
-        if route is None:
+        cands = route_for(requirements_for(body))
+        if not cands:
             self.send_error_body('openai', 503, 'no_free_model', 'no free model in the brief meets this request')
             return
-        try:
-            upstream = dial(route['id'], {**body, 'model': route['id']})
-        except Exception as err:  # an unreachable gateway is a 502 to this prompt
-            self.send_error_body('openai', 502, 'upstream_unreachable', str(err))
-            return
-        if not upstream.ok:
-            # TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that
-            # meets the requirements (10% of the score), and count the call it cost.
-            self.refused('openai', upstream.status, upstream.text())
-            return
-        if body.get('stream') is True:
-            self.stream_headers()
+        trails: list[Json] = []
+        for route in cands:
             try:
-                for frame in openai_stream_with_model(upstream.chunks(), route['id']):
-                    self.write_event(frame)
-            finally:
-                upstream.close()
+                upstream = dial(route['id'], {**body, 'model': route['id']})
+            except Exception as err:
+                self.send_error_body('openai', 502, 'upstream_unreachable', str(err))
+                return
+            if not upstream.ok:
+                trails.append({'status': upstream.status, 'code': 'upstream_error', 'model': route['id']})
+                if upstream.status in (429, 500, 502, 503, 504):
+                    COOLDOWNS[route['id']] = time.time() + 45.0
+                continue
+            if body.get('stream') is True:
+                self.stream_headers()
+                if trails:
+                    self.send_header('x-makefun-upstream-failures', json.dumps(trails[:8], separators=(',', ':')))
+                try:
+                    for frame in openai_stream_with_model(upstream.chunks(), route['id']):
+                        self.write_event(frame)
+                finally:
+                    upstream.close()
+                return
+            answer = upstream.text()
+            upstream.close()
+            try:
+                parsed = json.loads(answer)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            trail_header = json.dumps(trails[:8], separators=(',', ':')) if trails else None
+            self.send_json(200, openai_json_with_model(parsed if is_record(parsed) else {}, route['id']),
+                           extra_headers=trail_header)
             return
-        answer = upstream.text()
-        try:
-            parsed = json.loads(answer)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        self.send_json(200, openai_json_with_model(parsed if is_record(parsed) else {}, route['id']))
+        self.send_error_body('openai', 502, 'upstream_error', 'every free model refused')
 
     def messages(self) -> None:
-        """POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back."""
+        """POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions, best model, failing over."""
         body = self.read_json()
         if body is None:
             self.send_error_body('anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object')
             return
-        route = route_for(requirements_for(body))
-        if route is None:
+        cands = route_for(requirements_for(body))
+        if not cands:
             self.send_error_body('anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request')
             return
-        try:
-            upstream = dial(route['id'], anthropic_to_openai(body, route['id']))
-        except Exception as err:  # an unreachable gateway is a 502 to this prompt
-            self.send_error_body('anthropic', 502, 'api_error', str(err))
-            return
-        if not upstream.ok:
-            # TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that
-            # meets the requirements (10% of the score), and count the call it cost.
-            self.refused('anthropic', upstream.status, upstream.text())
-            return
-        if body.get('stream') is True:
-            self.stream_headers()
+        trails: list[Json] = []
+        for route in cands:
             try:
-                for event in anthropic_events_from_openai(upstream.chunks(), route['id']):
-                    self.write_event(event)
-            finally:
-                upstream.close()
+                upstream = dial(route['id'], anthropic_to_openai(body, route['id']))
+            except Exception as err:
+                self.send_error_body('anthropic', 502, 'api_error', str(err))
+                return
+            if not upstream.ok:
+                trails.append({'status': upstream.status, 'code': 'upstream_error', 'model': route['id']})
+                if upstream.status in (429, 500, 502, 503, 504):
+                    COOLDOWNS[route['id']] = time.time() + 45.0
+                continue
+            if body.get('stream') is True:
+                self.stream_headers()
+                if trails:
+                    self.send_header('x-makefun-upstream-failures', json.dumps(trails[:8], separators=(',', ':')))
+                try:
+                    for event in anthropic_events_from_openai(upstream.chunks(), route['id']):
+                        self.write_event(event)
+                finally:
+                    upstream.close()
+                return
+            answer = upstream.text()
+            upstream.close()
+            try:
+                parsed = json.loads(answer)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            trail_header = json.dumps(trails[:8], separators=(',', ':')) if trails else None
+            self.send_json(200, openai_to_anthropic(parsed if is_record(parsed) else {}, route['id']),
+                           extra_headers=trail_header)
             return
-        answer = upstream.text()
-        try:
-            parsed = json.loads(answer)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        self.send_json(200, openai_to_anthropic(parsed if is_record(parsed) else {}, route['id']))
+        self.send_error_body('anthropic', 502, 'api_error', 'every free model refused')
 
 
 # ---------------------------------------------------------------- register and poll
