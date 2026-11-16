@@ -650,6 +650,7 @@ def chat_completions_url() -> str:
 
 
 def served_models() -> list[Json]:
+    """The free catalogue, deduplicated by id: both /v1/models answers list exactly this set."""
     return [{'id': m['id'], 'provider': m['provider'], 'display_name': m['display_name']} for m in free_models(BRIEF)]
 
 
